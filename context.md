@@ -271,3 +271,107 @@ The entire automated CI/CD loop has completed with **SUCCESS**:
 4. **Live Verification:** HTTP probe returned **HTTP/1.1 200 OK** (`Content-Length: 48487`).
 5. **Live URL:** **`http://172.16.20.12:8080`** (Accessible across the entire `172.16.20.0/24` cluster).
 
+---
+
+## 9. Public Domain & Cloudflare Edge Ingress (`vault.swayamruparel.com`)
+
+- **Domain:** `vault.swayamruparel.com`
+- **DNS / Edge:** Managed by Cloudflare (GoDaddy nameservers delegated to Cloudflare).
+- **Ingress Bridge:** Zero-Trust `cloudflared` tunnel container running on PC3 (`172.16.20.12`), routing traffic directly from Cloudflare Edge to the local application port:
+  ```
+  Internet User (Browser)
+          │ HTTPS (443)
+          ▼
+  Cloudflare Global Anycast Edge
+          │ Encrypted Tunnel (cloudflared)
+          ▼
+  PC3 [172.16.20.12] (cloudflared container)
+          │ HTTP (8080)
+          ▼
+  PC3 [172.16.20.12] (server2026-web container)
+  ```
+- **Tunnel Status:** Active, healthy, and publicly resolving `https://vault.swayamruparel.com`.
+
+---
+
+## 10. Requirement Evolution: Physical Datacentre Storage vs. Browser Storage
+
+### The Problem
+Previously, photos uploaded to the gallery were stored purely inside the client's browser using `IndexedDB`. When a user opened `https://vault.swayamruparel.com` on a mobile phone or another computer, the gallery reverted to default photos because the client-side IndexedDB was strictly isolated to that specific browser.
+
+### The Objective
+Photos uploaded via the web interface must be stored **directly on physical disk inside the datacentre** (on PC3 `/data/apps/server2026/storage/images`), indexed in a database, and synchronized across every visiting device and browser worldwide.
+
+### Implementation Completed in Codebase (Commit `65f4c31`):
+1. **FastAPI Backend Unification (`backend/app/main.py`):**
+   - Added root routes to serve `index.html` and `preview.html` directly alongside REST API endpoints `/api/v1/*`.
+   - Added health check `/health` returning `{ status: "ok", service: "vault-core", version: "1.0.0" }`.
+2. **Public Gallery Access & Auth Compatibility (`backend/app/api/deps.py` & `backend/app/core/config.py`):**
+   - Added `ALLOW_PUBLIC_GALLERY: bool = False` setting. When enabled (`true`), unauthenticated requests from public gallery visitors automatically map to a default administrative identity (`vault-admin-001`), while strict JWT Bearer authentication remains 100% active for authenticated requests.
+   - Retained complete test passing (**16/16 Pytest passed** in `backend/tests`).
+   - Configured SQLite fallback in `/data/storage/vault.db` if PostgreSQL is not attached, ensuring zero-configuration persistent storage.
+3. **Frontend API Integration (`index.html` & `preview.html`):**
+   - Ingestion: Upload file input and camera capture send `multipart/form-data` to `POST /api/v1/images/upload`.
+   - Hydration: On initial page load, `initVault()` calls `GET /api/v1/images` to fetch all plates stored on the datacentre server.
+   - Download & Deletion: Master downloads stream via `GET /api/v1/images/{id}/download`, and incinerate triggers `DELETE /api/v1/images/{id}`.
+   - Visual Badge: Datacentre-stored images display an emerald green `DATACENTRE` pill badge.
+4. **Persistent Datacentre Storage Mount (`jenkins_job_config.xml`):**
+   - Configured `Deploy on PC3` stage to run:
+     ```bash
+     docker run -d \
+       --name server2026-web \
+       -p 8080:80 \
+       -v /data/apps/server2026/storage:/data/storage \
+       --privileged \
+       --restart unless-stopped \
+       ${NEXUS_DOCKER}/${IMAGE_NAME}:${IMAGE_TAG}
+     ```
+   - All uploaded images saved to `/data/storage/images/` and the database `/data/storage/vault.db` persist directly on PC3's bare-metal disk across container rebuilds and host reboots.
+
+---
+
+## 11. Discovery in Build #43: Docker Hub Network Restriction on PC3
+
+### What Happened in Build #43
+- Source code was committed and pushed to both Gitea (`server2026-test.git`) and GitHub (`photo-vault.git`) at commit `65f4c31`.
+- Jenkins Pipeline Build #43 ran stages 1 through 5 successfully:
+  - Checkout from Gitea: OK
+  - Build & SonarQube Scanner: OK
+  - Package Artifact & Nexus Upload: OK
+  - Recursive Copy to PC3 (`Dockerfile`, `index.html`, `preview.html`, `backend/`): OK
+- **Stage `Docker Build on PC3` FAILED** with:
+  ```
+  #2 ERROR: failed to do request: Head "https://registry-1.docker.io/v2/library/python/manifests/3.12-slim": dial tcp 32.199.55.228:443: i/o timeout
+  Dockerfile:1
+  >>> FROM python:3.12-slim
+  ```
+
+### Technical Root Cause
+- The Proxmox hypervisor / Docker daemon on PC3 does not reliably route or resolve direct outbound connections to Docker Hub's `registry-1.docker.io` due to upstream network firewall/routing policies, causing `docker build --no-cache` to time out when fetching `python:3.12-slim`.
+- **Key Local Assets Available on PC3:**
+  - `nginx:alpine` image is locally present and verified in `docker images` on PC3.
+  - PC3 container runtime can reach `dl-cdn.alpinelinux.org` (verified via `apk update` and `apk add python3 py3-pip`).
+  - Nexus Docker Registry (`172.16.20.103:8082`) is fully operational on the LAN, authenticated (`jenkins:sm_khot88`), and accepts Docker images.
+
+---
+
+## 12. Strategic Action Plan for Next Session (Tomorrow)
+
+1. **Option A (Self-Contained Alpine Container - Recommended):**
+   - Update `Dockerfile` to base on `nginx:alpine` (which already exists on PC3).
+   - In `Dockerfile`: install `python3`, `py3-pip`, and Python packages (`fastapi`, `uvicorn`, `sqlalchemy`, etc.) using Alpine APK or binary wheels.
+   - Configure Nginx to reverse proxy port 80 to internal Uvicorn on `127.0.0.1:8000`.
+   - Zero dependency on Docker Hub — builds cleanly and rapidly directly on PC3.
+
+2. **Option B (Nexus Hosted / Cached Base Image):**
+   - Push a pre-pulled Python base image to Nexus (`172.16.20.103:8082/python:3.12-slim`).
+   - Change `Dockerfile` line 1 to `FROM 172.16.20.103:8082/python:3.12-slim`.
+   - Build pulls base image directly from local Nexus at Gigabit LAN speeds.
+
+3. **Execution & Live Sign-off:**
+   - Commit and push the chosen Dockerfile adjustment to Gitea.
+   - Trigger Jenkins Build #44.
+   - Verify deployment on `https://vault.swayamruparel.com`.
+   - Perform live photo upload and verify that `/data/apps/server2026/storage/images` on PC3 receives and permanently preserves the image file.
+
+
