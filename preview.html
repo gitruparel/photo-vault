@@ -556,6 +556,7 @@
       }
     ];
 
+    let serverPlates = [];
     let userPlates = [];
     let currentImages = [...vintageImages];
     let userAlbums = [];
@@ -735,9 +736,9 @@
         frame.className = "print-frame rounded-lg cursor-pointer select-none group relative";
         frame.onclick = () => openViewer(idx);
 
-        const customBadge = img.isCustom
-          ? `<div class="absolute top-2.5 left-2.5 bg-[#B28242] text-white font-mono text-[9px] px-2 py-0.5 rounded shadow tracking-wider uppercase font-bold">PERSISTED</div>`
-          : "";
+        const customBadge = img.isServer
+          ? `<div class="absolute top-2.5 left-2.5 bg-[#2E4522] text-[#E0EED4] font-mono text-[9px] px-2 py-0.5 rounded shadow tracking-wider uppercase font-bold border border-[#4E6F3B]">DATACENTRE</div>`
+          : (img.isCustom ? `<div class="absolute top-2.5 left-2.5 bg-[#B28242] text-white font-mono text-[9px] px-2 py-0.5 rounded shadow tracking-wider uppercase font-bold">LOCAL</div>` : "");
 
         frame.innerHTML = `
           <div class="overflow-hidden rounded aspect-[4/3] bg-[#EFE7D8] relative">
@@ -764,7 +765,7 @@
     }
 
     function applyActiveFilter() {
-      let pool = [...userPlates, ...vintageImages];
+      let pool = [...serverPlates, ...userPlates, ...vintageImages];
       if (activeAlbumFilter) {
         pool = pool.filter(i => i.albumId === activeAlbumFilter);
         const album = [...defaultAlbums, ...userAlbums].find(a => a.id === activeAlbumFilter);
@@ -788,7 +789,7 @@
 
     function handleSearch(val) {
       const q = val.toLowerCase().trim();
-      let pool = [...userPlates, ...vintageImages];
+      let pool = [...serverPlates, ...userPlates, ...vintageImages];
       if (activeAlbumFilter) {
         pool = pool.filter(i => i.albumId === activeAlbumFilter);
       }
@@ -839,7 +840,7 @@
       document.getElementById("albums-counter").innerText = `${allAlbums.length} albums`;
 
       allAlbums.forEach(album => {
-        const allPlates = [...userPlates, ...vintageImages];
+        const allPlates = [...serverPlates, ...userPlates, ...vintageImages];
         const count = allPlates.filter(p => p.albumId === album.id).length;
 
         const card = document.createElement("div");
@@ -991,6 +992,10 @@
     function downloadActiveImage() {
       const target = currentImages[activeIndex];
       if (!target) return;
+      if (target.isServer) {
+        window.open(`/api/v1/images/${target.id}/download`, "_blank");
+        return;
+      }
       const a = document.createElement("a");
       a.href = target.url;
       a.download = target.title || `vault_plate_${activeIndex + 1}.jpg`;
@@ -1003,6 +1008,14 @@
       const target = currentImages[activeIndex];
       if (!target) return;
       if (confirm(`Incinerate negative plate "${target.title}" permanently?`)) {
+        if (target.isServer) {
+          try {
+            await fetch(`/api/v1/images/${target.id}`, { method: "DELETE" });
+            serverPlates = serverPlates.filter(p => p.id !== target.id);
+          } catch (err) {
+            console.error("Datacentre delete error:", err);
+          }
+        }
         if (target.isCustom || target.id.startsWith("plate-")) {
           await dbDeletePlate(target.id);
         }
@@ -1078,24 +1091,66 @@
       ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
       const dataUrl = canvas.toDataURL("image/jpeg", 0.92);
 
-      const newPlate = {
-        id: `plate-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
-        title: `camera_exposure_${userPlates.length + 1}.jpg`,
-        caption: "Live Optical Camera Exposure // Sanitized Silver Halide Emulsion",
-        size: "2.8 MB",
-        dims: `${canvas.width} × ${canvas.height}`,
-        format: "JPEG (LIVE CAPTURE)",
-        hash: Array.from(new Uint8Array(32)).map(() => Math.floor(Math.random() * 16).toString(16)).join(""),
-        url: dataUrl,
-        isCustom: true,
-        timestamp: Date.now(),
-        albumId: ""
-      };
+      let serverSuccess = false;
+      const filename = `camera_exposure_${Date.now()}.jpg`;
 
-      await dbSavePlate(newPlate);
-      userPlates.unshift(newPlate);
-      currentImages.unshift(newPlate);
+      // 1. Try streaming directly to Datacentre Server API
+      try {
+        const blob = await new Promise(resolve => canvas.toBlob(resolve, "image/jpeg", 0.92));
+        const formData = new FormData();
+        formData.append("files", blob, filename);
+        const res = await fetch("/api/v1/images/upload", {
+          method: "POST",
+          body: formData
+        });
+        if (res.ok) {
+          const data = await res.json();
+          data.forEach(item => {
+            const newPlate = {
+              id: item.id,
+              title: item.original_filename,
+              caption: "Live Optical Camera Exposure // Stored on Bare-Metal Cluster",
+              size: `${(item.file_size / (1024 * 1024)).toFixed(1)} MB`,
+              dims: `${item.width} × ${item.height}`,
+              format: "JPEG (LIVE CAPTURE)",
+              hash: item.checksum_sha256,
+              url: `/api/v1/images/${item.id}/file`,
+              thumbUrl: `/api/v1/images/${item.id}/thumbnail`,
+              isServer: true,
+              timestamp: new Date(item.created_at).getTime(),
+              albumId: ""
+            };
+            serverPlates.unshift(newPlate);
+            currentImages.unshift(newPlate);
+          });
+          serverSuccess = true;
+        }
+      } catch (err) {
+        console.warn("Server camera upload failed, falling back to local storage:", err);
+      }
+
+      // 2. Fallback to local storage if offline
+      if (!serverSuccess) {
+        const newPlate = {
+          id: `plate-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
+          title: filename,
+          caption: "Live Optical Camera Exposure // Sanitized Silver Halide Emulsion",
+          size: "2.8 MB",
+          dims: `${canvas.width} × ${canvas.height}`,
+          format: "JPEG (LIVE CAPTURE)",
+          hash: Array.from(new Uint8Array(32)).map(() => Math.floor(Math.random() * 16).toString(16)).join(""),
+          url: dataUrl,
+          isCustom: true,
+          timestamp: Date.now(),
+          albumId: ""
+        };
+        await dbSavePlate(newPlate);
+        userPlates.unshift(newPlate);
+        currentImages.unshift(newPlate);
+      }
+
       renderGallery(currentImages);
+      renderAlbums();
       stopLiveCamera();
 
       const container = document.getElementById("upload-queue-container");
@@ -1104,8 +1159,8 @@
           <div class="flex items-center gap-3">
             <div class="w-8 h-8 rounded-lg bg-[#2E4522] text-[#E0EED4] flex items-center justify-center font-bold">✓</div>
             <div>
-              <p class="font-semibold text-[#203118]">${newPlate.title}</p>
-              <p class="text-[10px] text-[#4E6F3B]">Captured & Persisted across page refreshes</p>
+              <p class="font-semibold text-[#203118]">${filename}</p>
+              <p class="text-[10px] text-[#4E6F3B]">${serverSuccess ? "Captured & stored directly on datacentre server" : "Captured & persisted locally"}</p>
             </div>
           </div>
           <span class="text-[#2E4522] font-semibold">Done</span>
@@ -1123,36 +1178,77 @@
       const container = document.getElementById("upload-queue-container");
       container.innerHTML = `
         <div class="p-3.5 rounded-xl bg-[#FAF6EE] border border-[#C79A59] text-xs font-mono text-[#7A6B5F] flex items-center gap-2">
-          <span class="animate-spin">⏳</span> Ingesting and persisting ${files.length} plate(s) into vault storage...
+          <span class="animate-spin">⏳</span> Ingesting ${files.length} plate(s) into datacentre server storage...
         </div>
       `;
 
-      for (let i = 0; i < files.length; i++) {
-        const file = files[i];
-        try {
-          const dataUrl = await readFileAsDataUrl(file);
-          const newPlate = {
-            id: `plate-${Date.now()}-${i}-${Math.random().toString(36).substring(2, 7)}`,
-            title: file.name,
-            caption: "Uploaded Archive Negative // Persisted in Secure Local Storage",
-            size: `${(file.size / (1024 * 1024)).toFixed(1)} MB`,
-            dims: "Archival High Resolution",
-            format: (file.type ? file.type.split("/")[1] : "RAW").toUpperCase(),
-            hash: Array.from(new Uint8Array(32)).map(() => Math.floor(Math.random() * 16).toString(16)).join(""),
-            url: dataUrl,
-            isCustom: true,
-            timestamp: Date.now() + i,
-            albumId: ""
-          };
-          await dbSavePlate(newPlate);
-          userPlates.unshift(newPlate);
-          currentImages.unshift(newPlate);
-        } catch (err) {
-          console.error("Failed to read file:", file.name, err);
+      // 1. Try uploading directly to Datacentre Server API
+      let serverSuccess = false;
+      try {
+        const formData = new FormData();
+        for (let i = 0; i < files.length; i++) {
+          formData.append("files", files[i]);
+        }
+        const res = await fetch("/api/v1/images/upload", {
+          method: "POST",
+          body: formData
+        });
+        if (res.ok) {
+          const data = await res.json();
+          data.forEach(item => {
+            const newPlate = {
+              id: item.id,
+              title: item.original_filename,
+              caption: "Datacentre Server Archive // Stored on Bare-Metal Cluster",
+              size: `${(item.file_size / (1024 * 1024)).toFixed(1)} MB`,
+              dims: `${item.width} × ${item.height}`,
+              format: (item.mime_type.split("/")[1] || "JPEG").toUpperCase(),
+              hash: item.checksum_sha256,
+              url: `/api/v1/images/${item.id}/file`,
+              thumbUrl: `/api/v1/images/${item.id}/thumbnail`,
+              isServer: true,
+              timestamp: new Date(item.created_at).getTime(),
+              albumId: item.album_id || ""
+            };
+            serverPlates.unshift(newPlate);
+            currentImages.unshift(newPlate);
+          });
+          serverSuccess = true;
+        }
+      } catch (netErr) {
+        console.warn("Datacentre API upload failed, falling back to local storage:", netErr);
+      }
+
+      // 2. Fallback to local storage if offline
+      if (!serverSuccess) {
+        for (let i = 0; i < files.length; i++) {
+          const file = files[i];
+          try {
+            const dataUrl = await readFileAsDataUrl(file);
+            const newPlate = {
+              id: `plate-${Date.now()}-${i}-${Math.random().toString(36).substring(2, 7)}`,
+              title: file.name,
+              caption: "Local Device Archive // Persisted in Offline Storage",
+              size: `${(file.size / (1024 * 1024)).toFixed(1)} MB`,
+              dims: "Archival High Resolution",
+              format: (file.type ? file.type.split("/")[1] : "RAW").toUpperCase(),
+              hash: Array.from(new Uint8Array(32)).map(() => Math.floor(Math.random() * 16).toString(16)).join(""),
+              url: dataUrl,
+              isCustom: true,
+              timestamp: Date.now() + i,
+              albumId: ""
+            };
+            await dbSavePlate(newPlate);
+            userPlates.unshift(newPlate);
+            currentImages.unshift(newPlate);
+          } catch (err) {
+            console.error("Local read error:", file.name, err);
+          }
         }
       }
 
       renderGallery(currentImages);
+      renderAlbums();
 
       container.innerHTML = `
         <div class="p-3.5 rounded-xl bg-[#F0F5EB] border border-[#B3C8A4] flex items-center justify-between text-xs font-mono">
@@ -1160,7 +1256,7 @@
             <div class="w-8 h-8 rounded-lg bg-[#2E4522] text-[#E0EED4] flex items-center justify-center font-bold">✓</div>
             <div>
               <p class="font-semibold text-[#203118]">${files.length} Negative Plate(s) Ingested</p>
-              <p class="text-[10px] text-[#4E6F3B]">Saved & Persisted across page refreshes</p>
+              <p class="text-[10px] text-[#4E6F3B]">${serverSuccess ? "Committed directly to bare-metal datacentre disk" : "Saved in local browser vault"}</p>
             </div>
           </div>
           <span class="text-[#2E4522] font-semibold">Done</span>
@@ -1170,7 +1266,7 @@
       setTimeout(() => {
         closeUploadModal();
         container.innerHTML = "";
-      }, 1000);
+      }, 1200);
     }
 
     function handleMobileCameraInput(files) {
@@ -1202,12 +1298,12 @@
     }
 
     function updateTelemetryCounters() {
-      const allPlates = [...userPlates, ...vintageImages];
+      const allPlates = [...serverPlates, ...userPlates, ...vintageImages];
       const countEl = document.getElementById("settings-plates-count");
       if (countEl) countEl.innerText = `${allPlates.length} Plates`;
 
-      // Estimate storage: 24.8MB base + 2.8MB per user plate
-      const totalMb = (24.8 + (userPlates.length * 2.8)).toFixed(1);
+      // Estimate storage
+      const totalMb = (24.8 + ((serverPlates.length + userPlates.length) * 2.8)).toFixed(1);
       const storageEl = document.getElementById("settings-storage-used");
       if (storageEl) storageEl.innerText = `${totalMb} MB`;
     }
@@ -1223,33 +1319,58 @@
       if (e.key === "ArrowRight") navigateViewer(1);
     });
 
-    // Initial load from IndexedDB & LocalStorage
+    // Initial load: Datacentre Server + LocalStorage
     async function initVault() {
-      // Load saved user name
+      // 1. Load saved user name
       const savedName = localStorage.getItem("vault_user_name") || "Alice Vault";
       const passportInput = document.getElementById("passport-name-input");
       if (passportInput) passportInput.value = savedName;
       const initials = savedName.split(" ").map(w => w[0]).join("").toUpperCase().slice(0, 2);
       document.getElementById("header-avatar").innerText = initials;
 
-      // Load plates from IndexedDB
+      // 2. Fetch Datacentre Plates from server API
+      try {
+        const res = await fetch("/api/v1/images");
+        if (res.ok) {
+          const data = await res.json();
+          if (data && data.items) {
+            serverPlates = data.items.map(item => ({
+              id: item.id,
+              title: item.original_filename,
+              caption: "Datacentre Server Archive // Stored on Bare-Metal Cluster",
+              size: `${(item.file_size / (1024 * 1024)).toFixed(1)} MB`,
+              dims: `${item.width} × ${item.height}`,
+              format: (item.mime_type.split("/")[1] || "JPEG").toUpperCase(),
+              hash: item.checksum_sha256,
+              url: `/api/v1/images/${item.id}/file`,
+              thumbUrl: `/api/v1/images/${item.id}/thumbnail`,
+              isServer: true,
+              timestamp: new Date(item.created_at).getTime(),
+              albumId: item.album_id || ""
+            }));
+          }
+        }
+      } catch (err) {
+        console.warn("Could not query datacentre server API:", err);
+      }
+
+      // 3. Load plates from IndexedDB
       try {
         userPlates = await dbGetAllPlates();
         userPlates.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
       } catch (err) {
-        console.warn("Could not load persisted plates:", err);
+        console.warn("Could not load local persisted plates:", err);
         userPlates = [];
       }
 
-      // Load albums from IndexedDB
+      // 4. Load albums
       try {
         userAlbums = await dbGetAllAlbums();
       } catch (err) {
-        console.warn("Could not load albums:", err);
         userAlbums = [];
       }
 
-      currentImages = [...userPlates, ...vintageImages];
+      currentImages = [...serverPlates, ...userPlates, ...vintageImages];
       renderGallery(currentImages);
       renderAlbums();
       populateAlbumSelect();

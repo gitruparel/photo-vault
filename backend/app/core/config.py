@@ -1,3 +1,4 @@
+import os
 from typing import List, Optional
 from pydantic import AnyHttpUrl, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -9,6 +10,7 @@ class Settings(BaseSettings):
     API_V1_STR: str = "/api/v1"
     ENVIRONMENT: str = "production"
     DEBUG: bool = False
+    ALLOW_PUBLIC_GALLERY: bool = False
 
     # Security & Tokens
     SECRET_KEY: str = "CHANGE_THIS_IN_PRODUCTION_SUPER_SECRET_VAULT_KEY_2026_A98F71B3"
@@ -45,6 +47,10 @@ class Settings(BaseSettings):
             if self.DATABASE_URL.startswith("sqlite"):
                 return self.DATABASE_URL
             return self.DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://")
+        if self.POSTGRES_SERVER in ["localhost", "127.0.0.1", "none", "", "sqlite"]:
+            os.makedirs(self.STORAGE_LOCAL_ROOT, exist_ok=True)
+            db_path = os.path.abspath(os.path.join(self.STORAGE_LOCAL_ROOT, "vault.db"))
+            return f"sqlite:///{db_path}"
         return f"postgresql://{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}@{self.POSTGRES_SERVER}:{self.POSTGRES_PORT}/{self.POSTGRES_DB}"
 
     # Storage Settings

@@ -104,6 +104,24 @@ async def global_exception_handler(request: Request, exc: Exception):
 # Mount routers
 app.include_router(api_router, prefix=settings.API_V1_STR)
 
+# Serve frontend HTML directly from root
+from fastapi.responses import FileResponse
+import os
+
+@app.get("/", include_in_schema=False)
+async def serve_index():
+    for candidate in ["/app/index.html", "index.html", os.path.join(os.path.dirname(__file__), "..", "..", "index.html")]:
+        if os.path.exists(candidate):
+            return FileResponse(candidate)
+    return JSONResponse(status_code=404, content={"detail": "index.html not found"})
+
+@app.get("/preview.html", include_in_schema=False)
+async def serve_preview():
+    for candidate in ["/app/preview.html", "preview.html", os.path.join(os.path.dirname(__file__), "..", "..", "preview.html")]:
+        if os.path.exists(candidate):
+            return FileResponse(candidate)
+    return JSONResponse(status_code=404, content={"detail": "preview.html not found"})
+
 # Direct root health endpoint for standard load balancers & Docker healthchecks
 @app.get("/health", tags=["Health"])
 def root_health():
