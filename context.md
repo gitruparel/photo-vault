@@ -365,35 +365,31 @@ Photos uploaded via the web interface must be stored **directly on physical disk
 
 ---
 
-## 11. Current Cluster Health & Infrastructure Status (Verified Live)
+## 11. Strict Invariant: Reverse Proxy & Cloudflare Stack (LOCKED - DO NOT TOUCH)
 
-All 4 physical nodes and their virtualized services are confirmed **ONLINE and HEALTHY**:
-
-| Node / Service | Role | IP / Port | Live Status |
-| :--- | :--- | :--- | :--- |
-| **PC1 (`pve10`)** | Hypervisor | `172.16.20.10` | **ONLINE** (Ping < 3ms) |
-| **PC1 (CT101)** | Jenkins CI/CD | `172.16.20.101:8080` | **ONLINE** (HTTP 200/403 API) |
-| **PC1 (CT100)** | SonarQube | `172.16.20.102:9000` | **ONLINE** |
-| **PC2 (`pve11`)** | Hypervisor | `172.16.20.11` | **ONLINE** (Ping < 3ms) |
-| **PC2 (CT102)** | Gitea Git | `172.16.20.100:3000` | **ONLINE** (HTTP 200 API) |
-| **PC2 (CT103)** | Nexus Registry | `172.16.20.103:8081` / `:8082` | **ONLINE** (Docker Registry V2) |
-| **PC3 (`pve12`)** | Docker Runtime | `172.16.20.12` | **ONLINE** (Docker Compose v5.5.1 active) |
-| **PC3 (`network_tunnel-net`)** | Nginx Proxy Manager | `172.16.20.12:81` / `:80` | **ONLINE** (Proxy routing active) |
-| **PC3 (`network_tunnel-net`)** | Cloudflare Tunnel | `vault.swayamruparel.com` | **ONLINE** (Cloudflared active) |
-| **PC4 (`pve13`)** | Hypervisor | `172.16.20.13` | **ONLINE** |
-| **PC4 (CT106)** | Central PostgreSQL | `172.16.20.106:5432` | **ONLINE** (Accepting connections) |
+The reverse proxy and Cloudflare Tunnel infrastructure on PC3 is **100% locked in and must not be touched or modified by AI agents or automated scripts**:
+1. **Never edit or restart the edge stack:** `/root/network/docker-compose.yml` (`nginx-proxy-manager` and `cloudflared`) is permanent and managed externally by the user.
+2. **Never modify Cloudflare Tunnel configs:** Cloudflare Tunnel connects directly to the Nginx Proxy Manager ingress.
+3. **The Multi-App Scaling Standard:**
+   For every new project, service, or repository deployed on PC3:
+   - **Step 1:** The CI/CD pipeline builds the container and runs it attached to **`--network network_tunnel-net`** (e.g. `--name <app_name> --network network_tunnel-net --privileged`).
+   - **Step 2:** The user creates a new Proxy Host in the Nginx Proxy Manager Web GUI (`http://172.16.20.12:81`):
+     - **Domain Names:** `<subdomain>.swayamruparel.com`
+     - **Forward Hostname / IP:** `<app_name>` (resolves via internal Docker DNS on `network_tunnel-net`)
+     - **Forward Port:** Container port (e.g. `80`)
+   - That's all — no configuration files, code edits, or edge reloads required.
 
 ---
 
 ## 12. Deployment Next Steps: Photo Vault with Persistent Datacentre Storage
 
 1. **Deploy Application Container on `network_tunnel-net`:**
-   - Build and run `server2026-web` with:
+   - Run `server2026-web` with:
      - Volume: `-v /data/apps/server2026/storage:/data/storage`
      - Network: `--network network_tunnel-net`
      - Permissions: `--privileged`
 2. **Nginx Proxy Manager Route:**
-   - In Nginx Proxy Manager (`http://172.16.20.12:81`), configure proxy host:
+   - In Nginx Proxy Manager (`http://172.16.20.12:81`), configure or verify proxy host:
      - Domain: `vault.swayamruparel.com`
      - Forward Hostname / IP: `server2026-web`
      - Forward Port: `80`
@@ -401,7 +397,16 @@ All 4 physical nodes and their virtualized services are confirmed **ONLINE and H
    - Verify `https://vault.swayamruparel.com/health`.
    - Upload a test photo via the public web interface.
    - Verify the photo receives the emerald `DATACENTRE` badge.
-   - Confirm file physical persistence in `/data/apps/server2026/storage/images/` on PC3.
+   - Confirm physical persistence in `/data/apps/server2026/storage/images/` on PC3.
+
+---
+
+## 13. Session Checkpoint & State (September 25, 2026)
+
+- **Datacentre Hardware State:** All physical cluster nodes and containers were powered down at the end of the session.
+- **Codebase State:** Fully implemented, tested (16/16 Pytest passed), and committed to GitHub.
+- **Ready to resume:** When cluster nodes are powered back on, trigger Jenkins Build or run container with `--network network_tunnel-net`.
+
 
 
 
