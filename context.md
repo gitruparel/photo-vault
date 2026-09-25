@@ -273,24 +273,58 @@ The entire automated CI/CD loop has completed with **SUCCESS**:
 
 ---
 
-## 9. Public Domain & Cloudflare Edge Ingress (`vault.swayamruparel.com`)
+## 9. Public Domain & Edge Ingress: Nginx Proxy Manager + Cloudflare Tunnel
 
-- **Domain:** `vault.swayamruparel.com`
-- **DNS / Edge:** Managed by Cloudflare (GoDaddy nameservers delegated to Cloudflare).
-- **Ingress Bridge:** Zero-Trust `cloudflared` tunnel container running on PC3 (`172.16.20.12`), routing traffic directly from Cloudflare Edge to the local application port:
+On PC3 (`172.16.20.12`), edge ingress and reverse proxy routing are managed by a dedicated Docker Compose stack located in `/root/network/docker-compose.yml`:
+
+```
+Internet Visitor
+      │ HTTPS (443)
+      ▼
+Cloudflare Edge Anycast
+      │ Encrypted Zero-Trust Tunnel
+      ▼
+PC3 [172.16.20.12] (cloudflared container)
+      │ Internal Docker Bridge Network (`network_tunnel-net`)
+      ▼
+PC3 [172.16.20.12] (nginx-proxy-manager container :80 / :443 / :81)
+      │ Reverse Proxy over `network_tunnel-net`
+      ▼
+PC3 [172.16.20.12] (server2026-web / future app containers)
+```
+
+### Docker Network Specification: `network_tunnel-net`
+All edge routing on PC3 relies on a dedicated Docker bridge network created by Compose:
+- **Network Name:** **`network_tunnel-net`** (Driver: `bridge`)
+- **MANDATORY INVARIANT:** Every web application container deployed on PC3 (including `server2026-web` and all 100s of future project repositories) **MUST be attached to `network_tunnel-net`**:
+  ```bash
+  docker run -d --name <app-name> --network network_tunnel-net --privileged ...
   ```
-  Internet User (Browser)
-          │ HTTPS (443)
-          ▼
-  Cloudflare Global Anycast Edge
-          │ Encrypted Tunnel (cloudflared)
-          ▼
-  PC3 [172.16.20.12] (cloudflared container)
-          │ HTTP (8080)
-          ▼
-  PC3 [172.16.20.12] (server2026-web container)
+  or in `docker-compose.yml`:
+  ```yaml
+  networks:
+    default:
+      external:
+        name: network_tunnel-net
   ```
-- **Tunnel Status:** Active, healthy, and publicly resolving `https://vault.swayamruparel.com`.
+- **Why this is critical:** Containers on `network_tunnel-net` communicate using internal Docker DNS. Nginx Proxy Manager can route directly to `http://<container_name>:<port>` (e.g., `http://server2026-web:80`) with zero port collisions on the host.
+
+### Edge Stack Containers on PC3 (`/root/network/`):
+1. **`nginx-proxy-manager` (`jc21/nginx-proxy-manager:latest`):**
+   - **Container Name:** `nginx-proxy-manager`
+   - **Privileged:** `true` (resolves Proxmox kernel `socketpair()` restrictions)
+   - **Ports Exposed on PC3 Host:**
+     - `80:80` (HTTP Ingress)
+     - `443:443` (HTTPS Ingress)
+     - `81:81` (Admin Web GUI: `http://172.16.20.12:81`)
+   - **Persistent Volumes:** `/root/network/data` and `/root/network/letsencrypt`
+   - **Network:** `network_tunnel-net`
+
+2. **`cloudflared` (`cloudflare/cloudflared:latest`):**
+   - **Container Name:** `cloudflared`
+   - **Tunnel Command:** `tunnel --no-autoupdate run`
+   - **Public Hostname:** `vault.swayamruparel.com`
+   - **Network:** `network_tunnel-net`
 
 ---
 
@@ -315,11 +349,12 @@ Photos uploaded via the web interface must be stored **directly on physical disk
    - Hydration: On initial page load, `initVault()` calls `GET /api/v1/images` to fetch all plates stored on the datacentre server.
    - Download & Deletion: Master downloads stream via `GET /api/v1/images/{id}/download`, and incinerate triggers `DELETE /api/v1/images/{id}`.
    - Visual Badge: Datacentre-stored images display an emerald green `DATACENTRE` pill badge.
-4. **Persistent Datacentre Storage Mount (`jenkins_job_config.xml`):**
+4. **Persistent Datacentre Storage Mount & Network Ingress (`jenkins_job_config.xml`):**
    - Configured `Deploy on PC3` stage to run:
      ```bash
      docker run -d \
        --name server2026-web \
+       --network network_tunnel-net \
        -p 8080:80 \
        -v /data/apps/server2026/storage:/data/storage \
        --privileged \
@@ -330,48 +365,43 @@ Photos uploaded via the web interface must be stored **directly on physical disk
 
 ---
 
-## 11. Discovery in Build #43: Docker Hub Network Restriction on PC3
+## 11. Current Cluster Health & Infrastructure Status (Verified Live)
 
-### What Happened in Build #43
-- Source code was committed and pushed to both Gitea (`server2026-test.git`) and GitHub (`photo-vault.git`) at commit `65f4c31`.
-- Jenkins Pipeline Build #43 ran stages 1 through 5 successfully:
-  - Checkout from Gitea: OK
-  - Build & SonarQube Scanner: OK
-  - Package Artifact & Nexus Upload: OK
-  - Recursive Copy to PC3 (`Dockerfile`, `index.html`, `preview.html`, `backend/`): OK
-- **Stage `Docker Build on PC3` FAILED** with:
-  ```
-  #2 ERROR: failed to do request: Head "https://registry-1.docker.io/v2/library/python/manifests/3.12-slim": dial tcp 32.199.55.228:443: i/o timeout
-  Dockerfile:1
-  >>> FROM python:3.12-slim
-  ```
+All 4 physical nodes and their virtualized services are confirmed **ONLINE and HEALTHY**:
 
-### Technical Root Cause
-- The Proxmox hypervisor / Docker daemon on PC3 does not reliably route or resolve direct outbound connections to Docker Hub's `registry-1.docker.io` due to upstream network firewall/routing policies, causing `docker build --no-cache` to time out when fetching `python:3.12-slim`.
-- **Key Local Assets Available on PC3:**
-  - `nginx:alpine` image is locally present and verified in `docker images` on PC3.
-  - PC3 container runtime can reach `dl-cdn.alpinelinux.org` (verified via `apk update` and `apk add python3 py3-pip`).
-  - Nexus Docker Registry (`172.16.20.103:8082`) is fully operational on the LAN, authenticated (`jenkins:sm_khot88`), and accepts Docker images.
+| Node / Service | Role | IP / Port | Live Status |
+| :--- | :--- | :--- | :--- |
+| **PC1 (`pve10`)** | Hypervisor | `172.16.20.10` | **ONLINE** (Ping < 3ms) |
+| **PC1 (CT101)** | Jenkins CI/CD | `172.16.20.101:8080` | **ONLINE** (HTTP 200/403 API) |
+| **PC1 (CT100)** | SonarQube | `172.16.20.102:9000` | **ONLINE** |
+| **PC2 (`pve11`)** | Hypervisor | `172.16.20.11` | **ONLINE** (Ping < 3ms) |
+| **PC2 (CT102)** | Gitea Git | `172.16.20.100:3000` | **ONLINE** (HTTP 200 API) |
+| **PC2 (CT103)** | Nexus Registry | `172.16.20.103:8081` / `:8082` | **ONLINE** (Docker Registry V2) |
+| **PC3 (`pve12`)** | Docker Runtime | `172.16.20.12` | **ONLINE** (Docker Compose v5.5.1 active) |
+| **PC3 (`network_tunnel-net`)** | Nginx Proxy Manager | `172.16.20.12:81` / `:80` | **ONLINE** (Proxy routing active) |
+| **PC3 (`network_tunnel-net`)** | Cloudflare Tunnel | `vault.swayamruparel.com` | **ONLINE** (Cloudflared active) |
+| **PC4 (`pve13`)** | Hypervisor | `172.16.20.13` | **ONLINE** |
+| **PC4 (CT106)** | Central PostgreSQL | `172.16.20.106:5432` | **ONLINE** (Accepting connections) |
 
 ---
 
-## 12. Strategic Action Plan for Next Session (Tomorrow)
+## 12. Deployment Next Steps: Photo Vault with Persistent Datacentre Storage
 
-1. **Option A (Self-Contained Alpine Container - Recommended):**
-   - Update `Dockerfile` to base on `nginx:alpine` (which already exists on PC3).
-   - In `Dockerfile`: install `python3`, `py3-pip`, and Python packages (`fastapi`, `uvicorn`, `sqlalchemy`, etc.) using Alpine APK or binary wheels.
-   - Configure Nginx to reverse proxy port 80 to internal Uvicorn on `127.0.0.1:8000`.
-   - Zero dependency on Docker Hub — builds cleanly and rapidly directly on PC3.
+1. **Deploy Application Container on `network_tunnel-net`:**
+   - Build and run `server2026-web` with:
+     - Volume: `-v /data/apps/server2026/storage:/data/storage`
+     - Network: `--network network_tunnel-net`
+     - Permissions: `--privileged`
+2. **Nginx Proxy Manager Route:**
+   - In Nginx Proxy Manager (`http://172.16.20.12:81`), configure proxy host:
+     - Domain: `vault.swayamruparel.com`
+     - Forward Hostname / IP: `server2026-web`
+     - Forward Port: `80`
+3. **End-to-End Verification:**
+   - Verify `https://vault.swayamruparel.com/health`.
+   - Upload a test photo via the public web interface.
+   - Verify the photo receives the emerald `DATACENTRE` badge.
+   - Confirm file physical persistence in `/data/apps/server2026/storage/images/` on PC3.
 
-2. **Option B (Nexus Hosted / Cached Base Image):**
-   - Push a pre-pulled Python base image to Nexus (`172.16.20.103:8082/python:3.12-slim`).
-   - Change `Dockerfile` line 1 to `FROM 172.16.20.103:8082/python:3.12-slim`.
-   - Build pulls base image directly from local Nexus at Gigabit LAN speeds.
-
-3. **Execution & Live Sign-off:**
-   - Commit and push the chosen Dockerfile adjustment to Gitea.
-   - Trigger Jenkins Build #44.
-   - Verify deployment on `https://vault.swayamruparel.com`.
-   - Perform live photo upload and verify that `/data/apps/server2026/storage/images` on PC3 receives and permanently preserves the image file.
 
 
